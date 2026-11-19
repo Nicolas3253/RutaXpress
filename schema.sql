@@ -251,3 +251,186 @@ INNER JOIN usuarios u_cli ON c.usuario_id = u_cli.id
 LEFT JOIN transportistas t ON e.transportista_id = t.id
 LEFT JOIN usuarios u_rep ON t.usuario_id
 
+
+SELECT 
+    estado,
+    COUNT(*) AS total_envios,
+    ROUND(AVG(peso_kg), 2) AS peso_promedio_kg,
+    SUM(costo) AS ingresos_totales
+FROM envios
+GROUP BY estado
+ORDER BY total_envios DESC;
+
+
+---Vista
+CREATE OR REPLACE VIEW vw_envios_pendientes AS
+SELECT 
+    id AS envio_id,
+    codigo_rastreo,
+    cliente_id,
+    origen_via,
+    origen_numero,
+    origen_barrio,
+    destino_via,
+    destino_numero,
+    destino_barrio,
+    peso_kg,
+    costo,
+    fecha_creacion
+FROM envios
+WHERE estado = 'pendiente';
+
+
+--Roles y permisos
+CREATE ROLE rol_admin_rx NOLOGIN;
+CREATE ROLE rol_repartidor_rx NOLOGIN;
+CREATE ROLE rol_cliente_rx NOLOGIN;
+
+GRANT USAGE ON SCHEMA public TO rol_admin_rx, rol_repartidor_rx, rol_cliente_rx;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rol_admin_rx, rol_repartidor_rx, rol_cliente_rx;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON rol, usuarios, clientes, transportistas, envios TO rol_admin_rx;
+GRANT SELECT, INSERT ON historial_ubicaciones_envio TO rol_admin_rx;
+
+GRANT SELECT ON vw_envios_pendientes, envios, transportistas TO rol_repartidor_rx;
+GRANT INSERT ON historial_ubicaciones_envio TO rol_repartidor_rx;
+GRANT UPDATE (estado, transportista_id) ON envios TO rol_repartidor_rx;
+GRANT UPDATE (disponible) ON transportistas TO rol_repartidor_rx;
+
+GRANT SELECT, INSERT ON envios TO rol_cliente_rx;
+GRANT SELECT, UPDATE (via, numero_via, placa, barrio, ciudad) ON clientes TO rol_cliente_rx;
+GRANT SELECT (id, nombre, apellido, email, telefono) ON usuarios TO rol_cliente_rx;
+
+CREATE USER user_repartidor_demo WITH PASSWORD 'Repartidor2026*';
+GRANT rol_repartidor_rx TO user_repartidor_demo;
+
+CREATE USER user_cliente_demo WITH PASSWORD 'Cliente2026*';
+GRANT rol_cliente_rx TO user_cliente_demo;
+
+
+
+--Funciones
+CREATE OR REPLACE FUNCTION fn_calcular_tarifa(
+    p_peso DECIMAL,
+    p_misma_ciudad BOOLEAN DEFAULT TRUE
+)
+RETURNS DECIMAL(10,2)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_tarifa_base DECIMAL(10,2) := 6000.00;
+    v_adicional_kg DECIMAL(10,2) := 2000.00;
+    v_recargo_intermunicipal DECIMAL(10,2) := 4000.00;
+    v_total DECIMAL(10,2);
+BEGIN
+    IF p_peso IS NULL OR p_peso <= 0 THEN
+        RAISE EXCEPTION 'El peso del envío debe ser mayor a 0 kg.';
+    END IF;
+
+    IF p_peso <= 1.0 THEN
+        v_total := v_tarifa_base;
+    ELSE
+        v_total := v_tarifa_base + ((p_peso - 1.0) * v_adicional_kg);
+    END IF;
+
+    IF NOT COALESCE(p_misma_ciudad, TRUE) THEN
+        v_total := v_total + v_recargo_intermunicipal;
+    END IF;
+
+    RETURN ROUND(v_total, 2);
+END;
+$$;
+
+
+
+--Procedimiento
+CREATE OR REPLACE PROCEDURE sp_asignar_envio(
+    p_envio_id INT,
+    p_transportista_id INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM envios WHERE id = p_envio_id AND estado = 'pendiente'
+    ) THEN
+        RAISE EXCEPTION 'El envío % no existe o ya no está pendiente.', p_envio_id;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM transportistas WHERE id = p_transportista_id AND disponible = TRUE
+    ) THEN
+        RAISE EXCEPTION 'El transportista % no está disponible.', p_transportista_id;
+    END IF;
+
+    UPDATE envios
+    SET transportista_id = p_transportista_id,
+        estado = 'en_camino'
+    WHERE id = p_envio_id;
+
+    UPDATE transportistas
+    SET disponible = FALSE
+    WHERE id = p_transportista_id;
+END;
+$$;
+
+
+
+--Trigger1
+CREATE OR REPLACE FUNCTION fn_validar_actualizacion_envio()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.estado IN ('entregado', 'cancelado') THEN
+        RAISE EXCEPTION 'No se puede modificar un envío en estado %.', OLD.estado;
+    END IF;
+    IF OLD.estado = 'pendiente' AND NEW.estado = 'entregado' THEN
+        RAISE EXCEPTION 'Un envío pendiente debe pasar primero a estado en_camino.';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+CREATE TRIGGER trg_validar_actualizacion_envio
+BEFORE UPDATE ON envios
+FOR EACH ROW
+EXECUTE FUNCTION fn_validar_actualizacion_envio();
+
+
+-
+-trigger2
+CREATE OR REPLACE FUNCTION fn_automatizar_cierre_envio()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.estado IS DISTINCT FROM NEW.estado
+       AND NEW.estado IN ('entregado', 'cancelado')
+       AND NEW.transportista_id IS NOT NULL THEN
+        UPDATE transportistas
+        SET disponible = TRUE
+        WHERE id = NEW.transportista_id;
+        INSERT INTO historial_ubicaciones_envio (
+            envio_id, transportista_id, latitud, longitud, estado_reportado
+        )
+        VALUES (
+            NEW.id, NEW.transportista_id, 7.11934900, -73.12274100, NEW.estado
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+CREATE TRIGGER trg_automatizar_cierre_envio
+AFTER UPDATE ON envios
+FOR EACH ROW
+EXECUTE FUNCTION fn_automatizar_cierre_envio();
+
+
+
+
