@@ -280,8 +280,7 @@ FOR EACH ROW
 EXECUTE FUNCTION fn_validar_actualizacion_envio();
 
 
--
--trigger2
+--trigger2
 CREATE OR REPLACE FUNCTION fn_automatizar_cierre_envio()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -310,7 +309,3 @@ CREATE TRIGGER trg_automatizar_cierre_envio
 AFTER UPDATE ON envios
 FOR EACH ROW
 EXECUTE FUNCTION fn_automatizar_cierre_envio();
-
-
-
-
